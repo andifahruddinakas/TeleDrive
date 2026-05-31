@@ -45,5 +45,13 @@ npm run dev
 4. Masukkan **Chat ID** (Gunakan [@userinfobot](https://t.me/userinfobot) dengan meneruskan pesan dari grup bot Anda).
 5. Mulai unggah file!
 
+<img width="610" height="1238" alt="image" src="https://github.com/user-attachments/assets/24b30683-fbe2-4e04-8900-269220157815" />
+
+<img width="610" height="1238" alt="image" src="https://github.com/user-attachments/assets/3f2d6b3e-59fb-4d45-8057-d99724f15a10" />
+
+<img width="610" height="1238" alt="image" src="https://github.com/user-attachments/assets/f62b780a-047c-4d8c-ad7b-69447b76436a" />
+
+<img width="610" height="1238" alt="image" src="https://github.com/user-attachments/assets/b57a7867-4297-490b-a59e-823a85c15718" />
+
 ---
 *Dibuat dengan ❤️ untuk manajemen file yang lebih cerdas.*
