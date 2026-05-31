@@ -1,0 +1,1130 @@
+import { useEffect, useRef, useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
+import { useTelegramBot } from "@/hooks/useTelegramBot";
+import { useToast } from "@/hooks/use-toast";
+import { v4 as uuidv4 } from "uuid";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { TelegramBotSetupAlert } from "@/components/TelegramBotSetupAlert";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Sheet, SheetContent, SheetHeader, SheetTitle,
+} from "@/components/ui/sheet";
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Progress } from "@/components/ui/progress";
+import {
+  Cloud, FolderPlus, Upload, Folder, FileText, Image as ImageIcon,
+  Video, Music, Archive, MoreVertical, Download, Trash2, Pencil,
+  ChevronRight, LogOut, Search, Loader2, Plus, ArrowLeft, X,
+  AlertTriangle, Info, Settings, Lock, User as UserIcon,
+  Eye, EyeOff, AlertCircle,
+} from "lucide-react";
+import {
+  CHUNK_SIZE, formatBytes, makeImageThumbnail, uploadChunk, downloadChunk,
+} from "@/lib/telegram-storage";
+
+type Folder = { id: string; name: string; parent_id: string | null };
+type FileRow = {
+  id: string; name: string; mime_type: string | null; size: number;
+  thumbnail_data_url: string | null; folder_id: string | null; created_at: string;
+};
+
+function fileIcon(mime: string | null) {
+  if (!mime) return FileText;
+  if (mime.startsWith("image/")) return ImageIcon;
+  if (mime.startsWith("video/")) return Video;
+  if (mime.startsWith("audio/")) return Music;
+  if (mime.includes("zip") || mime.includes("rar") || mime.includes("tar")) return Archive;
+  return FileText;
+}
+
+function fileIconColor(mime: string | null) {
+  if (!mime) return "text-muted-foreground bg-secondary";
+  if (mime.startsWith("image/")) return "text-emerald-600 bg-emerald-500/10";
+  if (mime.startsWith("video/")) return "text-rose-600 bg-rose-500/10";
+  if (mime.startsWith("audio/")) return "text-violet-600 bg-violet-500/10";
+  if (mime.includes("zip") || mime.includes("rar")) return "text-amber-600 bg-amber-500/10";
+  return "text-blue-600 bg-blue-500/10";
+}
+
+export default function Drive() {
+  const { user, signOut } = useAuth();
+  const { isConnected } = useTelegramBot();
+  const { toast } = useToast();
+  const [currentFolder, setCurrentFolder] = useState<Folder | null>(null);
+  const [trail, setTrail] = useState<Folder[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [files, setFiles] = useState<FileRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [renameTarget, setRenameTarget] = useState<{ kind: "file" | "folder"; id: string; name: string } | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [deleteDialog, setDeleteDialog] = useState<{ type: "file" | "folder" | null; target: FileRow | Folder | null; open: boolean }>({ type: null, target: null, open: false });
+  const [previewFile, setPreviewFile] = useState<FileRow | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [uploads, setUploads] = useState<Record<string, { name: string; pct: number; total: number }>>({});
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [profileAvatar, setProfileAvatar] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [processingMessage, setProcessingMessage] = useState<string | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
+  const [tgSetupOpen, setTgSetupOpen] = useState(false);
+  const [tgToken, setTgToken] = useState("");
+  const [tgChatId, setTgChatId] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { 
+    if (user) {
+      load(); 
+      loadProfile();
+    }
+  }, [user, currentFolder?.id]);
+
+  async function loadProfile() {
+    if (!user) return;
+    const { data } = await supabase.from("profiles").select("*").eq("user_id", user.id).single();
+    if (data) {
+      setProfileName(data.display_name ?? "");
+      setProfileAvatar(data.avatar_url ?? "");
+      setTgToken(data.telegram_bot_token ?? "");
+      setTgChatId(data.telegram_chat_id ?? "");
+      
+      // Auto open setup if empty
+      if (!data.telegram_bot_token || !data.telegram_chat_id) {
+        setTgSetupOpen(true);
+      }
+    } else {
+      // If no profile, we should probably create one or just open setup
+      setTgSetupOpen(true);
+    }
+  }
+
+  async function updateTelegramSettings() {
+    if (!user) return;
+    if (!tgToken || !tgChatId) {
+      return toast({ title: "Gagal", description: "Token dan Chat ID wajib diisi", variant: "destructive" });
+    }
+    
+    setProcessingMessage("Menghubungkan ke Telegram...");
+    const { error } = await supabase.from("profiles").update({
+      telegram_bot_token: tgToken,
+      telegram_chat_id: tgChatId,
+    }).eq("user_id", user.id);
+
+    if (error) {
+      toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    } else {
+      toast({ title: "Berhasil", description: "Telegram terhubung!" });
+      setTgSetupOpen(false);
+      loadProfile();
+    }
+    setProcessingMessage(null);
+  }
+
+  async function updateProfile() {
+    if (!user) return;
+    setProcessingMessage("Memperbarui profil...");
+    const { error } = await supabase.from("profiles").update({
+      display_name: profileName,
+      avatar_url: profileAvatar,
+    }).eq("user_id", user.id);
+
+    if (error) {
+      toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    } else {
+      toast({ title: "Berhasil", description: "Profil diperbarui" });
+      loadProfile();
+      setProfileOpen(false);
+    }
+    setProcessingMessage(null);
+  }
+
+  async function updatePassword() {
+    if (!newPassword || newPassword.length < 6) {
+      return toast({ title: "Gagal", description: "Password minimal 6 karakter", variant: "destructive" });
+    }
+    setProcessingMessage("Memperbarui password...");
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) {
+      toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    } else {
+      toast({ title: "Berhasil", description: "Password diperbarui" });
+      setNewPassword("");
+      setSecurityOpen(false);
+    }
+    setProcessingMessage(null);
+  }
+
+  async function load() {
+    setLoading(true);
+    const folderQ = supabase.from("folders").select("*").order("name");
+    const fileQ = supabase.from("files").select("*").order("created_at", { ascending: false });
+    const [f, fi] = await Promise.all([
+      currentFolder ? folderQ.eq("parent_id", currentFolder.id) : folderQ.is("parent_id", null),
+      currentFolder ? fileQ.eq("folder_id", currentFolder.id) : fileQ.is("folder_id", null),
+    ]);
+    if (f.error) toast({ title: "Error", description: f.error.message, variant: "destructive" });
+    if (fi.error) toast({ title: "Error", description: fi.error.message, variant: "destructive" });
+    setFolders((f.data ?? []) as Folder[]);
+    setFiles((fi.data ?? []) as FileRow[]);
+    setLoading(false);
+  }
+
+  async function searchAll() {
+    if (!search.trim()) { load(); return; }
+    setLoading(true);
+    const { data, error } = await supabase.from("files").select("*").ilike("name", `%${search}%`).order("name");
+    if (error) toast({ title: "Error", description: error.message, variant: "destructive" });
+    setFiles((data ?? []) as FileRow[]);
+    setFolders([]);
+    setLoading(false);
+  }
+
+  function openFolder(f: Folder) {
+    setTrail([...trail, f]);
+    setCurrentFolder(f);
+    setSearch("");
+  }
+  function goBreadcrumb(idx: number) {
+    if (idx === -1) { setTrail([]); setCurrentFolder(null); return; }
+    const newTrail = trail.slice(0, idx + 1);
+    setTrail(newTrail);
+    setCurrentFolder(newTrail[newTrail.length - 1] ?? null);
+  }
+  function goBack() {
+    if (trail.length === 0) return;
+    goBreadcrumb(trail.length - 2);
+  }
+
+  async function createFolder() {
+    if (!newFolderName.trim() || !user) return;
+    const { error } = await supabase.from("folders").insert({
+      name: newFolderName.trim(),
+      user_id: user.id,
+      parent_id: currentFolder?.id ?? null,
+    });
+    if (error) return toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    setNewFolderName(""); setNewFolderOpen(false); load();
+  }
+
+  async function handleFiles(list: FileList | null) {
+    if (!list || !user) return;
+    for (const file of Array.from(list)) {
+      const uid = uuidv4();
+      setUploads((u) => ({ ...u, [uid]: { name: file.name, pct: 0, total: file.size } }));
+      try {
+        const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+        const isChunked = totalChunks > 1;
+        const thumb = await makeImageThumbnail(file);
+
+        // Step 1: Upload semua chunks ke Telegram DULU (sebelum database operation)
+        const chunkResults: Array<{
+          telegram_file_id: string;
+          telegram_message_id: string;
+          size: number;
+        }> = [];
+
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const slice = file.slice(start, end);
+          const partName = isChunked ? `${file.name}.part${i + 1}of${totalChunks}` : file.name;
+
+          // Upload ke Telegram
+          const result = await uploadChunk(slice, partName);
+          chunkResults.push(result);
+
+          setUploads((u) => ({ ...u, [uid]: { ...u[uid], pct: Math.round(((i + 1) / totalChunks) * 100) } }));
+        }
+
+        // Step 2: Insert file ke database (HANYA jika semua chunks upload berhasil)
+        const { data: row, error: insErr } = await supabase.from("files").insert({
+          user_id: user.id,
+          folder_id: currentFolder?.id ?? null,
+          name: file.name,
+          mime_type: file.type || "application/octet-stream",
+          size: file.size,
+          thumbnail_data_url: thumb,
+          is_chunked: isChunked,
+        }).select().single();
+        if (insErr) throw insErr;
+
+        // Step 3: Insert chunks ke database
+        for (let i = 0; i < chunkResults.length; i++) {
+          const result = chunkResults[i];
+          const { error: cErr } = await supabase.from("file_chunks").insert({
+            file_id: row.id,
+            user_id: user.id,
+            chunk_index: i,
+            telegram_file_id: result.telegram_file_id,
+            telegram_message_id: result.telegram_message_id,
+            size: result.size,
+          });
+          if (cErr) throw cErr;
+        }
+
+        toast({ title: "Berhasil diunggah", description: file.name });
+      } catch (e: any) {
+        toast({ title: "Upload gagal", description: e.message, variant: "destructive" });
+      } finally {
+        setUploads((u) => { const c = { ...u }; delete c[uid]; return c; });
+        load();
+      }
+    }
+  }
+
+  async function downloadFile(f: FileRow) {
+    try {
+      toast({ title: "Mengunduh...", description: f.name });
+      const { data: chunks, error } = await supabase
+        .from("file_chunks").select("id, chunk_index")
+        .eq("file_id", f.id).order("chunk_index");
+      if (error || !chunks?.length) throw new Error("Tidak ada chunk");
+      const parts: Blob[] = [];
+      for (const c of chunks) parts.push(await downloadChunk(c.id));
+      const blob = new Blob(parts, { type: f.mime_type ?? "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = f.name; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      toast({ title: "Selesai", description: f.name });
+    } catch (e: any) {
+      toast({ title: "Gagal mengunduh", description: e.message, variant: "destructive" });
+    }
+  }
+
+  async function previewImage(f: FileRow) {
+    if (!f.mime_type?.startsWith("image/") && !f.mime_type?.startsWith("video/")) {
+      return downloadFile(f);
+    }
+    setPreviewFile(f); setPreviewUrl(null);
+    try {
+      const { data: chunks } = await supabase.from("file_chunks")
+        .select("id, chunk_index").eq("file_id", f.id).order("chunk_index");
+      if (!chunks?.length) throw new Error("Empty");
+      const parts: Blob[] = [];
+      for (const c of chunks) parts.push(await downloadChunk(c.id));
+      const blob = new Blob(parts, { type: f.mime_type ?? "application/octet-stream" });
+      setPreviewUrl(URL.createObjectURL(blob));
+    } catch (e: any) {
+      toast({ title: "Gagal", description: e.message, variant: "destructive" });
+      setPreviewFile(null);
+    }
+  }
+
+  async function deleteFile(f: FileRow) {
+    setDeleteDialog({ type: "file", target: f, open: true });
+  }
+
+  async function getAllFileIdsInFolder(folderId: string): Promise<string[]> {
+    const ids: string[] = [];
+    const { data: files } = await supabase.from("files").select("id").eq("folder_id", folderId);
+    if (files) ids.push(...files.map(f => f.id));
+    
+    const { data: subs } = await supabase.from("folders").select("id").eq("parent_id", folderId);
+    if (subs) {
+      for (const s of subs) {
+        const subIds = await getAllFileIdsInFolder(s.id);
+        ids.push(...subIds);
+      }
+    }
+    return ids;
+  }
+
+  async function confirmDeleteFile() {
+    if (!deleteDialog.target) return;
+    const f = deleteDialog.target as FileRow;
+    const { error } = await supabase.functions.invoke("tg-delete-file", { body: { file_id: f.id } });
+    if (error) {
+      toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    } else {
+      toast({ title: "Dihapus", description: f.name });
+      load();
+    }
+    setDeleteDialog({ type: null, target: null, open: false });
+  }
+
+  async function deleteFolder(f: Folder) {
+    setDeleteDialog({ type: "folder", target: f, open: true });
+  }
+
+  async function confirmDeleteFolder() {
+    if (deleteDialog.type !== "folder" || !deleteDialog.target || !user) return;
+    const f = deleteDialog.target as Folder;
+    setProcessingMessage(`Menganalisa isi folder "${f.name}"...`);
+
+    try {
+      // 1. Ambil semua ID file di dalam folder (termasuk subfolder)
+      const fileIds = await getAllFileIdsInFolder(f.id);
+      
+      // 2. Hapus file-file tersebut di Telegram via Edge Function
+      if (fileIds.length > 0) {
+        setProcessingMessage(`Membersihkan Cloud... (0/${fileIds.length})`);
+        
+        // Hapus satu per satu atau parallel tapi update message
+        let deleted = 0;
+        for (const id of fileIds) {
+          await supabase.functions.invoke("tg-delete-file", { body: { file_id: id } });
+          deleted++;
+          setProcessingMessage(`Membersihkan Cloud... (${deleted}/${fileIds.length})`);
+        }
+      }
+
+      setProcessingMessage(`Menghapus folder dari database...`);
+      // 3. Hapus folder dari database (akan cascade delete files di DB)
+      const { error } = await supabase.from("folders").delete().eq("id", f.id);
+      if (error) {
+        toast({ title: "Gagal", description: error.message, variant: "destructive" });
+      } else {
+        toast({ title: "Terhapus", description: `Folder "${f.name}" berhasil dihapus.` });
+      }
+    } catch (err) {
+      console.error("Folder delete error:", err);
+      toast({ title: "Error", description: "Terjadi kesalahan saat menghapus folder", variant: "destructive" });
+    }
+
+    setProcessingMessage(null);
+    setDeleteDialog({ type: null, target: null, open: false });
+    load();
+  }
+
+  async function commitRename() {
+    if (!renameTarget || !renameValue.trim()) return;
+    const table = renameTarget.kind === "file" ? "files" : "folders";
+    const { error } = await supabase.from(table).update({ name: renameValue.trim() }).eq("id", renameTarget.id);
+    if (error) return toast({ title: "Gagal", description: error.message, variant: "destructive" });
+    setRenameTarget(null); load();
+  }
+
+  const totalSize = files.reduce((s, f) => s + f.size, 0);
+  const initials = (profileName || user?.email || "U").slice(0, 1).toUpperCase();
+
+  const categories = [
+    { id: "all", label: "Semua", icon: Cloud, color: "text-blue-600 bg-blue-500/10" },
+    { id: "image", label: "Gambar", icon: ImageIcon, color: "text-emerald-600 bg-emerald-500/10" },
+    { id: "video", label: "Video", icon: Video, color: "text-rose-600 bg-rose-500/10" },
+    { id: "audio", label: "Audio", icon: Music, color: "text-violet-600 bg-violet-500/10" },
+    { id: "document", label: "Dokumen", icon: FileText, color: "text-amber-600 bg-amber-500/10" },
+    { id: "archive", label: "Arsip", icon: Archive, color: "text-zinc-600 bg-zinc-500/10" },
+  ];
+
+  const filteredFiles = files.filter(f => {
+    if (activeFilter === "all") return true;
+    if (activeFilter === "image") return f.mime_type?.startsWith("image/");
+    if (activeFilter === "video") return f.mime_type?.startsWith("video/");
+    if (activeFilter === "audio") return f.mime_type?.startsWith("audio/");
+    if (activeFilter === "archive") return f.mime_type?.includes("zip") || f.mime_type?.includes("rar") || f.mime_type?.includes("tar");
+    if (activeFilter === "document") {
+      const isOther = f.mime_type?.startsWith("image/") || f.mime_type?.startsWith("video/") || f.mime_type?.startsWith("audio/") || f.mime_type?.includes("zip") || f.mime_type?.includes("rar");
+      return !isOther;
+    }
+    return true;
+  });
+
+  return (
+    <div className="min-h-screen bg-gradient-soft pb-28">
+      {/* Header — mobile-first app bar */}
+      <header className="sticky top-0 z-20 bg-card/85 backdrop-blur-xl border-b border-border/60">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+          {/* Top row */}
+          <div className="h-14 flex items-center gap-3">
+            {trail.length > 0 ? (
+              <button
+                onClick={goBack}
+                className="w-10 h-10 -ml-2 grid place-items-center rounded-full hover:bg-secondary active:scale-95 transition"
+                aria-label="Kembali"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+            ) : (
+              <div className="w-9 h-9 rounded-xl bg-gradient-primary grid place-items-center shadow-elegant">
+                <Cloud className="w-5 h-5 text-primary-foreground" />
+              </div>
+            )}
+
+            <div className="flex-1 min-w-0">
+              <h1 className="font-semibold text-base truncate leading-tight">
+                {currentFolder?.name ?? "TeleDrive"}
+              </h1>
+              {!currentFolder && (
+                <p className="text-[11px] text-muted-foreground truncate">
+                  {files.length} file · {formatBytes(totalSize)}
+                </p>
+              )}
+            </div>
+
+            <button
+              onClick={() => setSearchOpen((v) => !v)}
+              className="w-10 h-10 grid place-items-center rounded-full hover:bg-secondary active:scale-95 transition"
+              aria-label="Cari"
+            >
+              <Search className="w-5 h-5" />
+            </button>
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  className="w-9 h-9 rounded-full bg-gradient-primary text-primary-foreground font-semibold text-sm grid place-items-center shadow-card active:scale-95 transition"
+                  aria-label="Akun"
+                >
+                  {initials}
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <div className="px-3 py-2 text-sm font-semibold truncate border-b border-border/40 mb-1 bg-secondary/20">
+                  {profileName || user?.email}
+                </div>
+                <DropdownMenuItem onClick={() => setProfileOpen(true)}>
+                  <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                    <UserIcon className="w-4 h-4" />
+                  </div>
+                  Profil
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setSecurityOpen(true)}>
+                  <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                    <Lock className="w-4 h-4" />
+                  </div>
+                  Keamanan
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={signOut} className="text-destructive focus:text-destructive">
+                  <div className="mr-2.5 pr-2.5 border-r border-destructive/20">
+                    <LogOut className="w-4 h-4" />
+                  </div>
+                  Keluar
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+
+          {/* Search bar — collapsible */}
+          {searchOpen && (
+            <div className="pb-3 -mt-1">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input
+                  autoFocus
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && searchAll()}
+                  placeholder="Cari file..."
+                  className="pl-9 pr-9 h-11 bg-secondary border-0 rounded-xl"
+                />
+                {search && (
+                  <button
+                    onClick={() => { setSearch(""); load(); }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 grid place-items-center rounded-full hover:bg-background"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+
+          
+          {/* Breadcrumbs (only when nested) */}
+          {trail.length > 0 && (
+            <div className="pb-2 flex items-center gap-1 text-xs text-muted-foreground overflow-x-auto scrollbar-none">
+              <button onClick={() => goBreadcrumb(-1)} className="hover:text-primary shrink-0">Drive Saya</button>
+              {trail.map((t, i) => (
+                <span key={t.id} className="flex items-center gap-1 shrink-0">
+                  <ChevronRight className="w-3 h-3" />
+                  <button
+                    onClick={() => goBreadcrumb(i)}
+                    className={i === trail.length - 1 ? "text-foreground font-medium" : "hover:text-primary"}
+                  >
+                    {t.name}
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-4">
+        {/* Category Filters */}
+        <div className="flex items-center gap-2 overflow-x-auto pb-4 mb-2 scrollbar-none">
+          {categories.map((cat) => {
+            const Icon = cat.icon;
+            const isActive = activeFilter === cat.id;
+            return (
+              <button
+                key={cat.id}
+                onClick={() => setActiveFilter(cat.id)}
+                className={`flex items-center gap-2 px-4 py-2 rounded-full border transition-all shrink-0 text-sm font-medium ${
+                  isActive 
+                    ? "bg-primary border-primary text-primary-foreground shadow-md scale-105" 
+                    : "bg-card border-border/50 hover:border-primary/50 text-muted-foreground"
+                }`}
+              >
+                <Icon className={`w-4 h-4 ${isActive ? "text-primary-foreground" : ""}`} />
+                {cat.label}
+              </button>
+            );
+          })}
+        </div>
+
+
+
+        {/* Active uploads */}
+        {Object.entries(uploads).length > 0 && (
+          <div className="mb-4 space-y-2">
+            {Object.entries(uploads).map(([id, u]) => (
+              <div key={id} className="bg-card rounded-2xl p-3 shadow-card border border-border/50">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="w-9 h-9 rounded-lg bg-primary/10 grid place-items-center shrink-0">
+                    <Upload className="w-4 h-4 text-primary" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{u.name}</p>
+                    <p className="text-xs text-muted-foreground">{u.pct}% · {formatBytes(u.total)}</p>
+                  </div>
+                </div>
+                <Progress value={u.pct} className="h-1.5" />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="grid place-items-center py-24">
+            <Loader2 className="animate-spin text-primary w-8 h-8" />
+          </div>
+        ) : folders.length === 0 && filteredFiles.length === 0 ? (
+          <div className="text-center py-24 px-6">
+            <div className="inline-flex w-24 h-24 rounded-3xl bg-gradient-primary/10 items-center justify-center mb-5">
+              <Cloud className="w-12 h-12 text-primary" />
+            </div>
+            <h3 className="text-lg font-semibold mb-1.5">
+              {activeFilter !== "all" ? "Tidak ada file di kategori ini" : "Belum ada apa-apa di sini"}
+            </h3>
+            <p className="text-sm text-muted-foreground mb-6 max-w-xs mx-auto">
+              {activeFilter !== "all" 
+                ? `Coba gunakan filter lain atau kembali ke kategori Semua.` 
+                : "Tap tombol + di bawah untuk unggah file atau buat folder baru."}
+            </p>
+            {activeFilter !== "all" && (
+              <Button variant="outline" onClick={() => setActiveFilter("all")} className="rounded-xl">
+                Tampilkan Semua
+              </Button>
+            )}
+          </div>
+        ) : (
+          <>
+            {/* Folders — horizontal chips on mobile feel */}
+            {folders.length > 0 && (
+              <section className="mb-6">
+                <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2.5 px-1">
+                  Folder
+                </h2>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+                  {folders.map((f) => (
+                    <div
+                      key={f.id}
+                      className="group relative bg-card rounded-2xl p-3 shadow-card hover:shadow-elegant active:scale-[0.98] transition-all cursor-pointer border border-border/40"
+                    >
+                      <div onClick={() => openFolder(f)} className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-primary/10 grid place-items-center shrink-0">
+                          <Folder className="w-5 h-5 text-primary fill-primary/20" />
+                        </div>
+                        <p className="text-sm font-medium truncate flex-1">{f.name}</p>
+                      </div>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            onClick={(e) => e.stopPropagation()}
+                            className="absolute top-1.5 right-1.5 p-1.5 rounded-full hover:bg-secondary opacity-60 hover:opacity-100"
+                          >
+                            <MoreVertical className="w-4 h-4" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => { setRenameTarget({ kind: "folder", id: f.id, name: f.name }); setRenameValue(f.name); }}>
+                            <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                              <Pencil className="w-4 h-4" />
+                            </div>
+                            Ubah nama
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => deleteFolder(f)} className="text-destructive focus:text-destructive">
+                            <div className="mr-2.5 pr-2.5 border-r border-destructive/20">
+                              <Trash2 className="w-4 h-4" />
+                            </div>
+                            Hapus
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Files — list view on mobile, grid on larger screens */}
+            {filteredFiles.length > 0 && (
+              <section>
+                <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2.5 px-1">
+                  {activeFilter === "all" ? "File" : categories.find(c => c.id === activeFilter)?.label}
+                </h2>
+
+                {/* Mobile: list rows */}
+                <div className="sm:hidden bg-card rounded-2xl shadow-card border border-border/40 overflow-hidden divide-y divide-border/40">
+                  {filteredFiles.map((f) => {
+                    const Icon = fileIcon(f.mime_type);
+                    const colors = fileIconColor(f.mime_type);
+                    return (
+                      <div
+                        key={f.id}
+                        className="flex items-center gap-3 p-3 active:bg-secondary/60 transition"
+                      >
+                        <button
+                          onClick={() => previewImage(f)}
+                          className="flex items-center gap-3 flex-1 min-w-0 text-left"
+                        >
+                          <div className={`w-12 h-12 rounded-xl grid place-items-center overflow-hidden shrink-0 ${colors}`}>
+                            {f.thumbnail_data_url ? (
+                              <img src={f.thumbnail_data_url} alt="" className="w-full h-full object-cover" />
+                            ) : (
+                              <Icon className="w-5 h-5" />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate">{f.name}</p>
+                            <p className="text-xs text-muted-foreground">{formatBytes(f.size)}</p>
+                          </div>
+                        </button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button className="w-9 h-9 grid place-items-center rounded-full hover:bg-secondary active:scale-95">
+                              <MoreVertical className="w-4 h-4" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={() => downloadFile(f)}>
+                              <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                                <Download className="w-4 h-4" />
+                              </div>
+                              Unduh
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setRenameTarget({ kind: "file", id: f.id, name: f.name }); setRenameValue(f.name); }}>
+                              <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                                <Pencil className="w-4 h-4" />
+                              </div>
+                              Ubah nama
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => deleteFile(f)} className="text-destructive focus:text-destructive">
+                              <div className="mr-2.5 pr-2.5 border-r border-destructive/20">
+                                <Trash2 className="w-4 h-4" />
+                              </div>
+                              Hapus
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Desktop / tablet: grid cards */}
+                <div className="hidden sm:grid sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
+                  {filteredFiles.map((f) => {
+                    const Icon = fileIcon(f.mime_type);
+                    const colors = fileIconColor(f.mime_type);
+                    return (
+                      <div key={f.id} className="group relative bg-card rounded-2xl shadow-card hover:shadow-elegant transition-all overflow-hidden border border-border/40">
+                        <div onClick={() => previewImage(f)} className="cursor-pointer">
+                          <div className="aspect-square bg-secondary/50 grid place-items-center overflow-hidden">
+                            {f.thumbnail_data_url ? (
+                              <img src={f.thumbnail_data_url} alt={f.name} className="w-full h-full object-cover" />
+                            ) : (
+                              <div className={`w-16 h-16 rounded-2xl grid place-items-center ${colors}`}>
+                                <Icon className="w-8 h-8" />
+                              </div>
+                            )}
+                          </div>
+                          <div className="p-3">
+                            <p className="text-sm font-medium truncate" title={f.name}>{f.name}</p>
+                            <p className="text-xs text-muted-foreground">{formatBytes(f.size)}</p>
+                          </div>
+                        </div>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button className="absolute top-2 right-2 w-8 h-8 grid place-items-center rounded-full bg-card/90 backdrop-blur opacity-0 group-hover:opacity-100">
+                              <MoreVertical className="w-4 h-4" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={() => downloadFile(f)}>
+                              <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                                <Download className="w-4 h-4" />
+                              </div>
+                              Unduh
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => { setRenameTarget({ kind: "file", id: f.id, name: f.name }); setRenameValue(f.name); }}>
+                              <div className="mr-2.5 pr-2.5 border-r border-border/50">
+                                <Pencil className="w-4 h-4" />
+                              </div>
+                              Ubah nama
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => deleteFile(f)} className="text-destructive focus:text-destructive">
+                              <div className="mr-2.5 pr-2.5 border-r border-destructive/20">
+                                <Trash2 className="w-4 h-4" />
+                              </div>
+                              Hapus
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+          </>
+        )}
+      </main>
+
+      {/* Floating Action Button — mobile-first */}
+      <button
+        onClick={() => setActionsOpen(true)}
+        className="fixed bottom-6 right-6 z-30 w-14 h-14 rounded-full bg-gradient-primary text-primary-foreground shadow-elegant grid place-items-center active:scale-95 transition hover:shadow-xl"
+        aria-label="Aksi"
+      >
+        <Plus className="w-6 h-6" />
+      </button>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
+      />
+
+      {/* Action sheet (mobile bottom sheet) */}
+      <Sheet open={actionsOpen} onOpenChange={setActionsOpen}>
+        <SheetContent side="bottom" className="rounded-t-3xl pb-8">
+          <SheetHeader className="mb-2">
+            <div className="mx-auto w-10 h-1 rounded-full bg-muted-foreground/30 mb-3" />
+            <SheetTitle className="text-left">Tambah Baru</SheetTitle>
+          </SheetHeader>
+          <div className="space-y-1">
+            <button
+              disabled={!isConnected}
+              onClick={() => { setActionsOpen(false); fileInputRef.current?.click(); }}
+              className="w-full flex items-center gap-4 p-3 rounded-xl hover:bg-secondary active:bg-secondary/80 transition text-left disabled:opacity-50 disabled:cursor-not-allowed"
+              title={!isConnected ? "Hubungkan Telegram bot untuk upload file" : ""}
+            >
+              <div className="w-11 h-11 rounded-xl bg-primary/10 grid place-items-center">
+                <Upload className="w-5 h-5 text-primary" />
+              </div>
+              <div>
+                <p className="font-medium text-sm">Unggah File</p>
+                <p className="text-xs text-muted-foreground">
+                  {!isConnected ? "Hubungkan bot terlebih dahulu" : "Pilih file dari perangkat"}
+                </p>
+              </div>
+            </button>
+            <button
+              onClick={() => { setActionsOpen(false); setNewFolderOpen(true); }}
+              className="w-full flex items-center gap-4 p-3 rounded-xl hover:bg-secondary active:bg-secondary/80 transition text-left"
+            >
+              <div className="w-11 h-11 rounded-xl bg-emerald-500/10 grid place-items-center">
+                <FolderPlus className="w-5 h-5 text-emerald-600" />
+              </div>
+              <div>
+                <p className="font-medium text-sm">Folder Baru</p>
+                <p className="text-xs text-muted-foreground">Buat folder untuk mengelompokkan</p>
+              </div>
+            </button>
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      {/* Profile Modal */}
+      <Dialog open={profileOpen} onOpenChange={setProfileOpen}>
+        <DialogContent className="rounded-2xl max-w-[90vw] sm:max-w-[400px]">
+          <div className="flex flex-col items-center text-center pt-4">
+            <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
+              <UserIcon className="w-8 h-8 text-primary" />
+            </div>
+            <DialogHeader className="space-y-1">
+              <DialogTitle className="text-xl text-center">Ubah Profil</DialogTitle>
+            </DialogHeader>
+          </div>
+          <div className="space-y-4 py-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground uppercase pl-1">Nama Tampilan</label>
+              <Input 
+                value={profileName}
+                onChange={(e) => setProfileName(e.target.value)}
+                placeholder="Nama Anda"
+                className="h-12 rounded-xl text-center"
+              />
+            </div>
+
+          </div>
+          <DialogFooter className="sm:justify-center gap-2">
+            <Button variant="outline" onClick={() => setProfileOpen(false)} className="rounded-xl px-8">Batal</Button>
+            <Button variant="hero" onClick={updateProfile} disabled={profileLoading} className="rounded-xl px-8">
+              {profileLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Simpan"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Security Modal */}
+      <Dialog open={securityOpen} onOpenChange={setSecurityOpen}>
+        <DialogContent className="rounded-2xl max-w-[90vw] sm:max-w-[400px]">
+          <div className="flex flex-col items-center text-center pt-4">
+            <div className="w-16 h-16 rounded-full bg-amber-500/10 flex items-center justify-center mb-4">
+              <Lock className="w-8 h-8 text-amber-600" />
+            </div>
+            <DialogHeader className="space-y-1">
+              <DialogTitle className="text-xl text-center">Keamanan</DialogTitle>
+            </DialogHeader>
+          </div>
+          <div className="space-y-4 py-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground uppercase pl-1 text-center block w-full">Password Baru</label>
+              <div className="relative group">
+                <Input 
+                  type={showPassword ? "text" : "password"}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="Minimal 6 karakter"
+                  className="h-12 rounded-xl text-center pr-12"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-muted-foreground hover:text-primary transition-colors"
+                >
+                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="sm:justify-center gap-2">
+            <Button variant="outline" onClick={() => setSecurityOpen(false)} className="rounded-xl px-8">Batal</Button>
+            <Button variant="hero" onClick={updatePassword} disabled={profileLoading} className="rounded-xl px-8 bg-amber-600 hover:bg-amber-700">
+              {profileLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Ganti Password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* New folder dialog */}
+      <Dialog open={newFolderOpen} onOpenChange={setNewFolderOpen}>
+        <DialogContent className="rounded-2xl max-w-[90vw] sm:max-w-[400px]">
+          <div className="flex flex-col items-center text-center pt-4">
+            <div className="w-16 h-16 rounded-full bg-emerald-500/10 flex items-center justify-center mb-4">
+              <FolderPlus className="w-8 h-8 text-emerald-600" />
+            </div>
+            <DialogHeader className="space-y-1">
+              <DialogTitle className="text-xl text-center">Folder Baru</DialogTitle>
+            </DialogHeader>
+          </div>
+          <div className="py-4">
+            <Input
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              placeholder="Masukkan nama folder..."
+              autoFocus
+              className="h-12 rounded-xl text-center"
+              onKeyDown={(e) => e.key === "Enter" && createFolder()}
+            />
+          </div>
+          <DialogFooter className="sm:justify-center gap-2">
+            <Button variant="outline" onClick={() => setNewFolderOpen(false)} className="rounded-xl px-8">Batal</Button>
+            <Button variant="hero" onClick={createFolder} className="rounded-xl px-8">Buat</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rename dialog */}
+      <Dialog open={!!renameTarget} onOpenChange={(o) => !o && setRenameTarget(null)}>
+        <DialogContent className="rounded-2xl max-w-[90vw] sm:max-w-[400px]">
+          <div className="flex flex-col items-center text-center pt-4">
+            <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
+              <Pencil className="w-8 h-8 text-primary" />
+            </div>
+            <DialogHeader className="space-y-1">
+              <DialogTitle className="text-xl text-center">Ubah Nama</DialogTitle>
+            </DialogHeader>
+          </div>
+          <div className="py-4">
+            <Input
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              autoFocus
+              className="h-12 rounded-xl text-center"
+              onKeyDown={(e) => e.key === "Enter" && commitRename()}
+            />
+          </div>
+          <DialogFooter className="sm:justify-center gap-2">
+            <Button variant="outline" onClick={() => setRenameTarget(null)} className="rounded-xl px-8">Batal</Button>
+            <Button variant="hero" onClick={commitRename} className="rounded-xl px-8">Simpan</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Preview dialog */}
+      <Dialog open={!!previewFile} onOpenChange={(o) => { if (!o) { setPreviewFile(null); if (previewUrl) URL.revokeObjectURL(previewUrl); setPreviewUrl(null); } }}>
+        <DialogContent className="max-w-4xl rounded-2xl">
+          <DialogHeader><DialogTitle className="truncate pr-6">{previewFile?.name}</DialogTitle></DialogHeader>
+          <div className="grid place-items-center min-h-[300px] bg-secondary rounded-xl overflow-hidden">
+            {!previewUrl ? <Loader2 className="animate-spin w-8 h-8 text-primary" /> :
+              previewFile?.mime_type?.startsWith("image/") ? (
+                <img src={previewUrl} alt={previewFile.name} className="max-h-[70vh] object-contain" />
+              ) : (
+                <video src={previewUrl} controls className="max-h-[70vh]" />
+              )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => previewFile && downloadFile(previewFile)}>
+              <Download className="w-4 h-4" /> Unduh
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete confirmation dialog */}
+      <AlertDialog open={deleteDialog.open} onOpenChange={(open) => !open && setDeleteDialog({ type: null, target: null, open: false })}>
+        <AlertDialogContent className="rounded-2xl max-w-[90vw] sm:max-w-[400px]">
+          <div className="flex flex-col items-center text-center pt-4">
+            <div className="w-20 h-20 rounded-full bg-destructive/10 flex items-center justify-center mb-4 animate-in zoom-in duration-300">
+              <AlertTriangle className="w-10 h-10 text-destructive" />
+            </div>
+            <AlertDialogHeader className="space-y-2">
+              <AlertDialogTitle className="text-2xl font-bold text-center">
+                {deleteDialog.type === "file" ? "Hapus File?" : "Hapus Folder?"}
+              </AlertDialogTitle>
+              <AlertDialogDescription className="text-base text-center">
+                {deleteDialog.type === "file" 
+                  ? `File "${(deleteDialog.target as FileRow)?.name}" akan dihapus secara permanen.`
+                  : `Folder "${(deleteDialog.target as Folder)?.name}" dan seluruh isinya akan dihapus secara permanen.`
+                }
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+          </div>
+          <div className="flex gap-3 justify-center mt-6">
+            <AlertDialogCancel className="rounded-xl px-8 h-11 border-border/60">Batal</AlertDialogCancel>
+            <AlertDialogAction 
+              onClick={() => deleteDialog.type === "file" ? confirmDeleteFile() : confirmDeleteFolder()}
+              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground rounded-xl px-8 h-11 shadow-lg shadow-destructive/20"
+            >
+              Hapus
+            </AlertDialogAction>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Telegram Setup Wizard */}
+      <Dialog open={tgSetupOpen} onOpenChange={setTgSetupOpen}>
+        <DialogContent className="rounded-3xl max-w-[95vw] sm:max-w-[500px] p-0 overflow-hidden border-none shadow-2xl">
+          <div className="bg-primary p-8 text-primary-foreground relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mt-16 blur-2xl" />
+            <div className="absolute bottom-0 left-0 w-24 h-24 bg-black/10 rounded-full -ml-12 -mb-12 blur-xl" />
+            
+            <div className="relative z-10 flex flex-col items-center text-center gap-4">
+              <div className="w-20 h-20 bg-white/20 backdrop-blur-md rounded-3xl flex items-center justify-center shadow-inner">
+                <Cloud className="w-10 h-10 text-white" />
+              </div>
+              <div className="space-y-1">
+                <DialogTitle className="text-2xl font-bold text-white text-center">Setup Telegram</DialogTitle>
+                <p className="text-white/80 text-sm">Hubungkan bot Anda untuk mulai menyimpan file</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-6 space-y-6 max-h-[60vh] overflow-y-auto custom-scrollbar">
+            {/* Step 1 */}
+            <div className="flex gap-4">
+              <div className="w-8 h-8 rounded-full bg-primary/10 text-primary flex items-center justify-center font-bold flex-shrink-0">1</div>
+              <div className="space-y-2">
+                <p className="font-semibold text-sm">Buat Bot di BotFather</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Buka <a href="https://t.me/BotFather" target="_blank" className="text-primary font-medium hover:underline inline-flex items-center gap-0.5">@BotFather <Info className="w-3 h-3" /></a> di Telegram, kirim <code className="bg-secondary px-1 py-0.5 rounded text-foreground">/newbot</code> dan ikuti instruksinya.
+                </p>
+              </div>
+            </div>
+
+            {/* Step 2 */}
+            <div className="flex gap-4">
+              <div className="w-8 h-8 rounded-full bg-primary/10 text-primary flex items-center justify-center font-bold flex-shrink-0">2</div>
+              <div className="space-y-3 flex-1">
+                <p className="font-semibold text-sm">Masukkan API Token</p>
+                <Input 
+                  value={tgToken}
+                  onChange={(e) => setTgToken(e.target.value)}
+                  placeholder="Contoh: 123456:ABC-DEF..."
+                  className="h-11 rounded-xl text-sm font-mono"
+                />
+              </div>
+            </div>
+
+            {/* Step 3 */}
+            <div className="flex gap-4">
+              <div className="w-8 h-8 rounded-full bg-primary/10 text-primary flex items-center justify-center font-bold flex-shrink-0">3</div>
+              <div className="space-y-2 flex-1">
+                <p className="font-semibold text-sm">Dapatkan Chat ID</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Buat Grup baru, tambahkan bot Anda ke sana. Lalu teruskan (forward) pesan apapun dari grup tersebut ke <a href="https://t.me/userinfobot" target="_blank" className="text-primary hover:underline">@userinfobot</a> untuk mendapatkan ID.
+                </p>
+                <Input 
+                  value={tgChatId}
+                  onChange={(e) => setTgChatId(e.target.value)}
+                  placeholder="Contoh: -100123456789"
+                  className="h-11 rounded-xl text-sm font-mono"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="p-6 bg-secondary/30 flex gap-3">
+            <Button variant="ghost" onClick={() => setTgSetupOpen(false)} className="flex-1 rounded-xl h-12">Nanti Saja</Button>
+            <Button variant="hero" onClick={updateTelegramSettings} className="flex-[2] rounded-xl h-12 shadow-elegant">
+              Hubungkan Bot
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Global Processing Overlay */}
+      {processingMessage && (
+
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-background/80 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="bg-card p-8 rounded-3xl shadow-elegant border border-border/50 flex flex-col items-center gap-4 max-w-xs text-center scale-in">
+            <div className="relative">
+              <div className="w-16 h-16 rounded-full border-4 border-primary/20 border-t-primary animate-spin" />
+              <Cloud className="w-6 h-6 text-primary absolute inset-0 m-auto" />
+            </div>
+            <div className="space-y-1.5">
+              <p className="font-semibold text-lg text-foreground">Mohon Tunggu</p>
+              <p className="text-sm text-muted-foreground leading-relaxed">{processingMessage}</p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
